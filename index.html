@@ -1,0 +1,1572 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Penilaian Tengah Semester Al-Qur'an Hadist XII</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f3f4f6; }
+        .drag-item { cursor: grab; }
+        .drag-item:active { cursor: grabbing; }
+        .hidden { display: none !important; }
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        .glass { background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); }
+    </style>
+</head>
+<body class="text-gray-800 antialiased h-screen flex flex-col overflow-hidden">
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, updateDoc, collection, getDocs, addDoc, onSnapshot, query, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by environment or defaults
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'pts-qurdis-app-123';
+        const firebaseConfigStr = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
+        
+        // Dummy config for local testing if env var is missing. In production, this will fail without real config,
+        // but Canvas usually provides a valid one or we rely on in-memory fallback for presentation.
+        let firebaseConfig = {};
+        try {
+            firebaseConfig = JSON.parse(firebaseConfigStr);
+        } catch(e) { console.warn("Invalid firebase config"); }
+
+        // We will build a robust IN-MEMORY fallback system that perfectly simulates Firestore
+        // so the app works flawlessly even if Firebase is not properly configured in the environment.
+        const USE_IN_MEMORY_DB = Object.keys(firebaseConfig).length === 0 || !firebaseConfig.apiKey;
+        
+        let db, auth, app;
+        let currentUser = null; // Represents authenticated app user (student or admin)
+        let systemUserId = null; // Represents the anonymous firebase user ID
+
+        // --- MOCK DATA ---
+        let memoryDB = {
+            settings: { 
+                kkm: 76, 
+                duration: 90, 
+                logo: 'https://placehold.co/100x100/15803d/ffffff?text=MA', 
+                adminUsername: 'admin', 
+                adminPassword: 'adminpassword' 
+            },
+            users: [], // { username, presensi, attempts, bestScore, lastAccessed }
+            results: [], // { username, presensi, score, date, type: 'real'|'tryout', details: {} }
+            questions: generateInitialQuestions() // Generates the 40 questions
+        };
+
+        function generateInitialQuestions() {
+            let q = [];
+            let idCounter = 1;
+            // 15 Pilihan Ganda (PG)
+            for(let i=1; i<=15; i++) {
+                q.push({
+                    id: 'q' + idCounter++,
+                    type: 'pg',
+                    text: `Soal Pilihan Ganda ke-${i} tentang membudayakan pola hidup sederhana, menyantuni dhuafa, berpikir positif atau sabar. (Kontekstual: Ali menemukan dompet...)`,
+                    options: ['Pilihan A', 'Pilihan B', 'Pilihan C', 'Pilihan D', 'Pilihan E'],
+                    answer: 'A' // Default answer
+                });
+            }
+            // 15 Pilihan Ganda Kompleks (PGK)
+            for(let i=1; i<=15; i++) {
+                q.push({
+                    id: 'q' + idCounter++,
+                    type: 'pgk',
+                    text: `Soal Pilihan Ganda Kompleks ke-${i}. Pilih beberapa pernyataan yang benar terkait sikap sabar saat tertimpa musibah.`,
+                    options: ['Pernyataan 1 (Benar)', 'Pernyataan 2 (Salah)', 'Pernyataan 3 (Benar)', 'Pernyataan 4 (Salah)', 'Pernyataan 5 (Benar)'],
+                    answer: [0, 2, 4] // Indices of correct answers
+                });
+            }
+            // 10 Menjodohkan
+            for(let i=1; i<=10; i++) {
+                q.push({
+                    id: 'q' + idCounter++,
+                    type: 'jodoh',
+                    text: `Jodohkanlah ayat/pernyataan berikut dengan makna yang tepat (Soal ke-${i}).`,
+                    pairs: [
+                        { left: `Ayat ${i}.1`, right: `Makna ${i}.A` },
+                        { left: `Ayat ${i}.2`, right: `Makna ${i}.B` },
+                        { left: `Ayat ${i}.3`, right: `Makna ${i}.C` }
+                    ]
+                });
+            }
+            return q;
+        }
+
+        // Initialize Firebase if config exists
+        if (!USE_IN_MEMORY_DB) {
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+            } catch(e) {
+                console.error("Firebase init failed, falling back to memory:", e);
+                useMemoryFallback();
+            }
+        }
+
+        async function initApp() {
+            if (!USE_IN_MEMORY_DB && auth) {
+                try {
+                    const userCredential = await signInAnonymously(auth);
+                    systemUserId = userCredential.user.uid;
+                    await loadSettingsFromFirestore();
+                } catch(e) {
+                    console.error("Auth failed, using memory DB", e);
+                    useMemoryFallback();
+                }
+            }
+            renderLogin();
+        }
+
+        function useMemoryFallback() {
+            console.log("Using In-Memory Database");
+        }
+
+        // --- DATA ACCESS ABSTRACTION ---
+        // These functions hide whether we are using Firebase or In-Memory
+        
+        async function getSettings() {
+            if(USE_IN_MEMORY_DB) return memoryDB.settings;
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'public', 'settings', 'main');
+                const docSnap = await getDoc(docRef);
+                if (docSnap.exists()) return docSnap.data();
+                // Default init in Firestore
+                await setDoc(docRef, memoryDB.settings);
+                return memoryDB.settings;
+            } catch(e) { return memoryDB.settings; }
+        }
+
+        async function saveSettings(newSettings) {
+            if(USE_IN_MEMORY_DB) {
+                memoryDB.settings = {...memoryDB.settings, ...newSettings};
+                return;
+            }
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'public', 'settings', 'main');
+                await setDoc(docRef, {...memoryDB.settings, ...newSettings}, {merge: true});
+            } catch(e) { console.error("Error saving settings", e); }
+        }
+
+        async function getQuestions() {
+            if(USE_IN_MEMORY_DB) return memoryDB.questions;
+            try {
+                const qRef = collection(db, 'artifacts', appId, 'public', 'data', 'questions');
+                const qSnap = await getDocs(qRef);
+                if(qSnap.empty) {
+                    // Seed questions
+                    for(let q of memoryDB.questions) {
+                        await setDoc(doc(qRef, q.id), q);
+                    }
+                    return memoryDB.questions;
+                }
+                let questions = [];
+                qSnap.forEach(d => questions.push(d.data()));
+                return questions;
+            } catch(e) { return memoryDB.questions; }
+        }
+
+        async function saveQuestion(q) {
+            if(USE_IN_MEMORY_DB) {
+                const idx = memoryDB.questions.findIndex(x => x.id === q.id);
+                if(idx >= 0) memoryDB.questions[idx] = q;
+                else memoryDB.questions.push(q);
+                return;
+            }
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'questions', q.id);
+                await setDoc(docRef, q);
+            } catch(e) { console.error(e); }
+        }
+        
+        async function deleteQuestionFromDB(id) {
+             if(USE_IN_MEMORY_DB) {
+                memoryDB.questions = memoryDB.questions.filter(x => x.id !== id);
+                return;
+            }
+            try {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'questions', id));
+            } catch(e) { console.error(e); }
+        }
+
+        async function getStudentAttempts(username, presensi) {
+            if(USE_IN_MEMORY_DB) {
+                let u = memoryDB.users.find(x => x.username === username && x.presensi === presensi);
+                return u ? u.attempts : 0;
+            }
+            try {
+                const docId = `${username}_${presensi}`.replace(/\s+/g, '_');
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'users', docId);
+                const docSnap = await getDoc(docRef);
+                return docSnap.exists() ? docSnap.data().attempts : 0;
+            } catch(e) { return 0; }
+        }
+
+        async function recordAttempt(username, presensi) {
+            if(USE_IN_MEMORY_DB) {
+                 let u = memoryDB.users.find(x => x.username === username && x.presensi === presensi);
+                 if(u) u.attempts++;
+                 else memoryDB.users.push({username, presensi, attempts: 1});
+                 return;
+            }
+            try {
+                const docId = `${username}_${presensi}`.replace(/\s+/g, '_');
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'users', docId);
+                const docSnap = await getDoc(docRef);
+                if(docSnap.exists()) {
+                    await updateDoc(docRef, { attempts: docSnap.data().attempts + 1 });
+                } else {
+                    await setDoc(docRef, { username, presensi, attempts: 1 });
+                }
+            } catch(e) { console.error(e); }
+        }
+
+        async function saveResult(resultData) {
+            if(USE_IN_MEMORY_DB) {
+                memoryDB.results.push(resultData);
+                return;
+            }
+            try {
+                const rRef = collection(db, 'artifacts', appId, 'public', 'data', 'results');
+                await addDoc(rRef, resultData);
+            } catch(e) { console.error(e); }
+        }
+        
+        async function getResults() {
+             if(USE_IN_MEMORY_DB) return memoryDB.results;
+             try {
+                const rRef = collection(db, 'artifacts', appId, 'public', 'data', 'results');
+                const rSnap = await getDocs(rRef);
+                let res = [];
+                rSnap.forEach(d => res.push(d.data()));
+                return res;
+             } catch(e) { return memoryDB.results; }
+        }
+
+        // Make functions globally available for UI interactions
+        window.api = { getSettings, saveSettings, getQuestions, saveQuestion, deleteQuestionFromDB, getStudentAttempts, recordAttempt, saveResult, getResults };
+        
+        // Start app
+        initApp();
+    </script>
+
+    
+    <!-- Top Navigation Bar -->
+    <header class="bg-green-700 text-white shadow-md z-10 p-4 flex justify-between items-center shrink-0">
+        <div class="flex items-center gap-3">
+            <img id="headerLogo" src="https://placehold.co/100x100/15803d/ffffff?text=MA" alt="Logo" class="h-10 w-10 rounded-full object-cover border-2 border-white shadow-sm">
+            <div>
+                <h1 class="text-xl font-bold leading-tight">PTS Al-Qur'an Hadis XII</h1>
+                <p class="text-xs text-green-100">MA. Mu'allimin NU Kota Malang | Disusun: Damat, S.Ag., S.Pd.</p>
+            </div>
+        </div>
+        <div id="userInfo" class="hidden flex items-center gap-4">
+            <span id="userNameDisplay" class="font-medium bg-green-800 px-3 py-1 rounded-full text-sm"></span>
+            <button onclick="logout()" class="hover:text-red-300 transition px-2" title="Keluar"><i class="fas fa-sign-out-alt text-lg"></i></button>
+        </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main id="appContainer" class="flex-1 overflow-y-auto relative w-full">
+        
+        <!-- View: Login -->
+        <div id="loginView" class="absolute inset-0 flex items-center justify-center p-4 bg-[url('https://www.transparenttextures.com/patterns/arabesque.png')] bg-green-50/50">
+            <div class="glass w-full max-w-md rounded-2xl shadow-xl overflow-hidden border border-green-100">
+                <div class="bg-green-600 p-6 text-center text-white">
+                    <h2 class="text-2xl font-bold mb-1">Masuk Aplikasi</h2>
+                    <p class="text-sm opacity-80">Silakan login sesuai peran Anda</p>
+                </div>
+                
+                <div class="flex border-b">
+                    <button onclick="switchLoginTab('student')" id="tabStudent" class="flex-1 py-3 font-semibold text-green-700 border-b-2 border-green-600 bg-green-50 transition">Siswa</button>
+                    <button onclick="switchLoginTab('admin')" id="tabAdmin" class="flex-1 py-3 font-semibold text-gray-500 border-b-2 border-transparent hover:bg-gray-50 transition">Guru / Admin</button>
+                </div>
+
+                <div class="p-6">
+                    <!-- Student Login Form -->
+                    <form id="studentLoginForm" onsubmit="handleLogin(event, 'student')" class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Nama Lengkap</label>
+                            <input type="text" id="studName" required class="w-full border-gray-300 rounded-lg shadow-sm focus:border-green-500 focus:ring focus:ring-green-200 transition px-4 py-2 border" placeholder="Masukkan nama lengkap">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Nomor Presensi (Password)</label>
+                            <input type="number" id="studPresensi" required class="w-full border-gray-300 rounded-lg shadow-sm focus:border-green-500 focus:ring focus:ring-green-200 transition px-4 py-2 border" placeholder="Contoh: 12">
+                        </div>
+                        <div class="bg-blue-50 text-blue-800 text-xs p-3 rounded-lg flex items-start gap-2 border border-blue-100">
+                            <i class="fas fa-info-circle mt-0.5"></i>
+                            <p>Kelas otomatis diatur ke Kelas XII. Kesempatan mengerjakan maksimal 3 kali.</p>
+                        </div>
+                        <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg shadow transition duration-200 flex justify-center items-center gap-2">
+                            <i class="fas fa-sign-in-alt"></i> Masuk Ujian
+                        </button>
+                    </form>
+
+                    <!-- Admin Login Form -->
+                    <form id="adminLoginForm" onsubmit="handleLogin(event, 'admin')" class="space-y-4 hidden">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Username Admin</label>
+                            <input type="text" id="adminUser" required class="w-full border-gray-300 rounded-lg shadow-sm focus:border-green-500 focus:ring focus:ring-green-200 transition px-4 py-2 border" placeholder="Username">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+                            <input type="password" id="adminPass" required class="w-full border-gray-300 rounded-lg shadow-sm focus:border-green-500 focus:ring focus:ring-green-200 transition px-4 py-2 border" placeholder="••••••••">
+                        </div>
+                        <button type="submit" class="w-full bg-gray-800 hover:bg-gray-900 text-white font-bold py-3 px-4 rounded-lg shadow transition duration-200 flex justify-center items-center gap-2">
+                            <i class="fas fa-user-shield"></i> Masuk Dashboard
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <!-- View: Admin Dashboard -->
+        <div id="adminView" class="hidden flex h-full">
+            <!-- Admin Sidebar -->
+            <aside class="w-64 bg-white border-r shadow-sm flex flex-col shrink-0 overflow-y-auto">
+                <nav class="p-4 space-y-1">
+                    <button onclick="showAdminPanel('hasil')" class="admin-nav-btn w-full flex items-center gap-3 px-4 py-3 text-left rounded-lg bg-green-50 text-green-700 font-medium transition" data-target="hasil">
+                        <i class="fas fa-chart-bar w-5 text-center"></i> Hasil Ujian
+                    </button>
+                    <button onclick="showAdminPanel('soal')" class="admin-nav-btn w-full flex items-center gap-3 px-4 py-3 text-left rounded-lg text-gray-600 hover:bg-gray-50 hover:text-gray-900 font-medium transition" data-target="soal">
+                        <i class="fas fa-edit w-5 text-center"></i> Kelola Soal
+                    </button>
+                    <button onclick="showAdminPanel('pengaturan')" class="admin-nav-btn w-full flex items-center gap-3 px-4 py-3 text-left rounded-lg text-gray-600 hover:bg-gray-50 hover:text-gray-900 font-medium transition" data-target="pengaturan">
+                        <i class="fas fa-cog w-5 text-center"></i> Pengaturan
+                    </button>
+                </nav>
+                <div class="mt-auto p-4 border-t">
+                    <button onclick="tryOutMode()" class="w-full flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium shadow-sm transition">
+                        <i class="fas fa-play"></i> Uji Coba (Siswa)
+                    </button>
+                </div>
+            </aside>
+
+            <!-- Admin Content Panels -->
+            <div class="flex-1 bg-gray-50 p-6 overflow-y-auto">
+                
+                <!-- Panel: Hasil Ujian -->
+                <div id="panel-hasil" class="admin-panel animate-fade-in">
+                    <div class="flex justify-between items-center mb-6">
+                        <h2 class="text-2xl font-bold text-gray-800">Rekapitulasi Hasil Ujian</h2>
+                        <button onclick="downloadCSV()" class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded shadow-sm text-sm font-medium flex items-center gap-2">
+                            <i class="fas fa-file-csv"></i> Download CSV
+                        </button>
+                    </div>
+                    <div class="bg-white rounded-xl shadow-sm border overflow-hidden">
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left text-sm whitespace-nowrap">
+                                <thead class="bg-gray-100 text-gray-700">
+                                    <tr>
+                                        <th class="px-6 py-4 font-semibold">No</th>
+                                        <th class="px-6 py-4 font-semibold">Nama Lengkap</th>
+                                        <th class="px-6 py-4 font-semibold">Kelas</th>
+                                        <th class="px-6 py-4 font-semibold text-center">No. Presensi</th>
+                                        <th class="px-6 py-4 font-semibold text-center">Nilai</th>
+                                        <th class="px-6 py-4 font-semibold">Status KKM</th>
+                                        <th class="px-6 py-4 font-semibold">Waktu Selesai</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="resultsTableBody" class="divide-y divide-gray-100">
+                                    <!-- Results will be injected here -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Panel: Kelola Soal -->
+                <div id="panel-soal" class="admin-panel hidden animate-fade-in">
+                    <div class="flex justify-between items-center mb-6">
+                        <div>
+                            <h2 class="text-2xl font-bold text-gray-800">Kelola Bank Soal</h2>
+                            <p class="text-gray-500 text-sm mt-1">Total Soal: <span id="totalSoalCount">0</span>/40 (Target: 15 PG, 15 PGK, 10 Jodoh)</p>
+                        </div>
+                        <div class="flex gap-2">
+                            <select id="newQuestionType" class="border rounded px-3 py-2 text-sm bg-white outline-none focus:ring-2 ring-green-500">
+                                <option value="pg">Pilihan Ganda (A-E)</option>
+                                <option value="pgk">Pilihan Ganda Kompleks</option>
+                                <option value="jodoh">Menjodohkan</option>
+                            </select>
+                            <button onclick="openQuestionModal()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded shadow-sm text-sm font-medium flex items-center gap-2">
+                                <i class="fas fa-plus"></i> Tambah Soal
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="grid grid-cols-1 gap-4" id="questionsList">
+                        <!-- Question list injected here -->
+                    </div>
+                </div>
+
+                <!-- Panel: Pengaturan -->
+                <div id="panel-pengaturan" class="admin-panel hidden animate-fade-in">
+                    <h2 class="text-2xl font-bold text-gray-800 mb-6">Pengaturan Aplikasi</h2>
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <!-- Ujian Settings -->
+                        <div class="bg-white p-6 rounded-xl shadow-sm border">
+                            <h3 class="text-lg font-semibold mb-4 text-gray-800 border-b pb-2">Pengaturan Ujian</h3>
+                            <div class="space-y-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Nilai KKM (Kriteria Ketuntasan Minimal)</label>
+                                    <input type="number" id="setKkm" class="w-full border rounded px-3 py-2 focus:ring-green-500 focus:border-green-500">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Waktu Ujian (Menit)</label>
+                                    <input type="number" id="setDuration" class="w-full border rounded px-3 py-2 focus:ring-green-500 focus:border-green-500">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">URL Logo Madrasah</label>
+                                    <input type="text" id="setLogo" class="w-full border rounded px-3 py-2 focus:ring-green-500 focus:border-green-500" placeholder="https://...">
+                                    <img id="logoPreview" src="" class="mt-2 h-16 w-16 object-cover rounded border hidden">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Keamanan -->
+                        <div class="bg-white p-6 rounded-xl shadow-sm border">
+                            <h3 class="text-lg font-semibold mb-4 text-gray-800 border-b pb-2">Keamanan Admin</h3>
+                            <div class="space-y-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Username Admin Baru</label>
+                                    <input type="text" id="setAdminUser" class="w-full border rounded px-3 py-2 focus:ring-green-500 focus:border-green-500">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Password Admin Baru</label>
+                                    <input type="password" id="setAdminPass" class="w-full border rounded px-3 py-2 focus:ring-green-500 focus:border-green-500" placeholder="Biarkan kosong jika tidak diubah">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="mt-6 flex justify-end">
+                        <button onclick="saveAdminSettings()" class="bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded-lg shadow font-medium flex items-center gap-2">
+                            <i class="fas fa-save"></i> Simpan Pengaturan
+                        </button>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+        <!-- View: Student Exam -->
+        <div id="examView" class="hidden h-full flex flex-col bg-white">
+            <!-- Exam Header Timer -->
+            <div class="bg-gray-800 text-white p-3 flex justify-between items-center shrink-0">
+                <div class="font-semibold" id="examStudentName">Siswa: -</div>
+                <div class="flex items-center gap-4">
+                    <div class="flex items-center gap-2 bg-gray-700 px-3 py-1 rounded text-red-400 font-mono text-xl font-bold">
+                        <i class="fas fa-clock"></i> <span id="timerDisplay">90:00</span>
+                    </div>
+                    <button onclick="confirmSubmitExam()" class="bg-blue-600 hover:bg-blue-500 px-4 py-1.5 rounded font-medium text-sm transition shadow">
+                        Selesai
+                    </button>
+                </div>
+            </div>
+
+            <!-- Exam Layout -->
+            <div class="flex flex-1 overflow-hidden">
+                <!-- Question Number Navigator (Sidebar on desktop, hidden on small mobile) -->
+                <div class="w-64 bg-gray-100 border-r p-4 overflow-y-auto hidden md:block shrink-0">
+                    <h3 class="font-bold text-gray-700 mb-3 border-b border-gray-300 pb-2">Navigasi Soal</h3>
+                    <div class="text-xs font-semibold text-gray-500 mb-2 mt-4">Pilihan Ganda (1-15)</div>
+                    <div class="grid grid-cols-4 gap-2 mb-2" id="navGridPG"></div>
+                    
+                    <div class="text-xs font-semibold text-gray-500 mb-2 mt-4">PG Kompleks (16-30)</div>
+                    <div class="grid grid-cols-4 gap-2 mb-2" id="navGridPGK"></div>
+                    
+                    <div class="text-xs font-semibold text-gray-500 mb-2 mt-4">Menjodohkan (31-40)</div>
+                    <div class="grid grid-cols-4 gap-2 mb-2" id="navGridJodoh"></div>
+                    
+                    <div class="mt-6 flex flex-col gap-2 text-xs">
+                        <div class="flex items-center gap-2"><div class="w-4 h-4 bg-white border border-gray-400 rounded-sm"></div> Belum Dijawab</div>
+                        <div class="flex items-center gap-2"><div class="w-4 h-4 bg-green-500 rounded-sm"></div> Sudah Dijawab</div>
+                        <div class="flex items-center gap-2"><div class="w-4 h-4 ring-2 ring-blue-500 ring-offset-1 bg-white border border-gray-400 rounded-sm"></div> Sedang Aktif</div>
+                    </div>
+                </div>
+
+                <!-- Active Question Area -->
+                <div class="flex-1 overflow-y-auto p-4 md:p-8 relative scroll-smooth" id="questionArea">
+                    <!-- Content injected here -->
+                    <div class="max-w-3xl mx-auto pb-20" id="examContentArea">
+                        
+                    </div>
+                    
+                    <!-- Floating Prev/Next Buttons -->
+                    <div class="fixed bottom-0 left-0 right-0 md:left-64 bg-white border-t p-4 flex justify-between shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)]">
+                        <button onclick="prevQuestion()" id="btnPrevQ" class="px-6 py-2 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded font-medium disabled:opacity-50">
+                            <i class="fas fa-arrow-left mr-2"></i> Sebelumnya
+                        </button>
+                        <button onclick="nextQuestion()" id="btnNextQ" class="px-6 py-2 bg-green-600 hover:bg-green-700 text-white rounded font-medium disabled:opacity-50">
+                            Selanjutnya <i class="fas fa-arrow-right ml-2"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- View: Result -->
+        <div id="resultView" class="hidden absolute inset-0 bg-gray-100 flex items-center justify-center p-4">
+            <div class="bg-white max-w-lg w-full rounded-2xl shadow-xl overflow-hidden animate-fade-in text-center">
+                <div class="bg-green-600 py-6 px-4">
+                    <h2 class="text-3xl font-bold text-white mb-2">Ujian Selesai!</h2>
+                    <p class="text-green-100">Alhamdulillah, Anda telah menyelesaikan penilaian.</p>
+                </div>
+                <div class="p-8">
+                    <div class="mb-6">
+                        <p class="text-gray-500 text-sm font-medium uppercase tracking-wider mb-1">Nilai Anda</p>
+                        <div class="text-6xl font-black text-gray-800" id="finalScoreDisplay">0</div>
+                    </div>
+                    
+                    <div id="kkmStatus" class="mb-8 p-3 rounded-lg font-semibold text-lg">
+                        <!-- Lulus / Tidak Lulus injected here -->
+                    </div>
+
+                    <div class="text-left bg-gray-50 rounded-xl p-4 border mb-6 space-y-2 text-sm text-gray-600">
+                        <div class="flex justify-between"><span class="font-medium">Nama:</span> <span id="resName"></span></div>
+                        <div class="flex justify-between"><span class="font-medium">No. Presensi:</span> <span id="resPresensi"></span></div>
+                        <div class="flex justify-between"><span class="font-medium">Kelas:</span> <span>XII</span></div>
+                        <div class="flex justify-between border-t pt-2 mt-2"><span class="font-medium">Pilihan Ganda:</span> <span id="resPG">0/15</span></div>
+                        <div class="flex justify-between"><span class="font-medium">PG Kompleks:</span> <span id="resPGK">0/15</span></div>
+                        <div class="flex justify-between"><span class="font-medium">Menjodohkan:</span> <span id="resJodoh">0/10</span></div>
+                    </div>
+
+                    <div class="flex gap-4">
+                        <button onclick="downloadStudentResult()" class="flex-1 bg-gray-800 hover:bg-gray-900 text-white py-3 rounded-lg font-medium transition">
+                            <i class="fas fa-download mr-2"></i> Unduh Hasil
+                        </button>
+                        <button onclick="logout()" class="flex-1 bg-red-100 hover:bg-red-200 text-red-700 py-3 rounded-lg font-medium transition">
+                            Keluar
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </main>
+
+    
+    <!-- Custom MessageBox Modal -->
+    <div id="msgBox" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 hidden backdrop-blur-sm">
+        <div class="bg-white rounded-xl shadow-2xl p-6 max-w-sm w-full mx-4 transform transition-all scale-95 opacity-0" id="msgBoxContent">
+            <div class="text-center">
+                <i id="msgIcon" class="fas fa-info-circle text-4xl mb-4 text-blue-500"></i>
+                <h3 id="msgTitle" class="text-lg font-bold text-gray-900 mb-2">Pesan</h3>
+                <p id="msgText" class="text-gray-600 text-sm mb-6"></p>
+                <div class="flex justify-center gap-3" id="msgButtons">
+                    <button onclick="closeMsgBox()" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-medium">Tutup</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Question Editor Modal -->
+    <div id="qModal" class="fixed inset-0 z-40 bg-gray-900/60 hidden flex flex-col justify-center items-center p-4">
+        <div class="bg-white w-full max-w-2xl max-h-[90vh] rounded-xl shadow-xl flex flex-col overflow-hidden">
+            <div class="bg-gray-100 border-b p-4 flex justify-between items-center">
+                <h3 class="font-bold text-lg text-gray-800" id="qModalTitle">Edit Soal</h3>
+                <button onclick="closeQuestionModal()" class="text-gray-500 hover:text-gray-800"><i class="fas fa-times text-xl"></i></button>
+            </div>
+            <div class="p-4 overflow-y-auto flex-1 space-y-4" id="qModalBody">
+                <input type="hidden" id="editQId">
+                <input type="hidden" id="editQType">
+                
+                <div>
+                    <label class="block text-sm font-semibold text-gray-700 mb-1">Teks Soal</label>
+                    <textarea id="editQText" rows="3" class="w-full border border-gray-300 rounded p-2 focus:ring-2 ring-blue-200 outline-none"></textarea>
+                    <p class="text-xs text-gray-500 mt-1">Soal kontekstual disarankan.</p>
+                </div>
+
+                <!-- Dynamic Option Area based on type -->
+                <div id="editOptionsArea" class="p-4 bg-gray-50 border rounded-lg">
+                    <!-- Injected by JS -->
+                </div>
+
+            </div>
+            <div class="bg-gray-50 border-t p-4 flex justify-end gap-3">
+                <button onclick="closeQuestionModal()" class="px-4 py-2 text-gray-600 bg-white border border-gray-300 rounded hover:bg-gray-100">Batal</button>
+                <button onclick="saveEditedQuestion()" class="px-4 py-2 bg-blue-600 text-white font-medium rounded hover:bg-blue-700">Simpan Soal</button>
+            </div>
+        </div>
+    </div>
+
+
+    <script>
+        // Global App State
+        const state = {
+            role: null, // 'student', 'admin', 'tryout'
+            user: null, // { name, presensi }
+            settings: {},
+            questions: [],
+            exam: {
+                active: false,
+                currentIndex: 0,
+                answers: {}, // map of qId -> answer data
+                timeLeft: 0,
+                timerInterval: null
+            },
+            sortables: [] // Store sortable instances
+        };
+
+        // Utility: Show Custom Message Box
+        function showMessage(title, text, type = 'info', onConfirm = null) {
+            const box = document.getElementById('msgBox');
+            const content = document.getElementById('msgBoxContent');
+            const icon = document.getElementById('msgIcon');
+            const btnArea = document.getElementById('msgButtons');
+            
+            document.getElementById('msgTitle').innerText = title;
+            document.getElementById('msgText').innerHTML = text; // Allow simple HTML
+            
+            // Icon setup
+            icon.className = 'fas text-4xl mb-4 ';
+            if(type === 'error') icon.className += 'fa-times-circle text-red-500';
+            else if(type === 'success') icon.className += 'fa-check-circle text-green-500';
+            else if(type === 'warning') icon.className += 'fa-exclamation-triangle text-yellow-500';
+            else icon.className += 'fa-info-circle text-blue-500';
+
+            // Buttons setup
+            if(onConfirm) {
+                btnArea.innerHTML = `
+                    <button id="msgCancel" class="bg-gray-200 hover:bg-gray-300 text-gray-800 px-4 py-2 rounded-lg font-medium transition">Batal</button>
+                    <button id="msgConfirm" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-medium transition">Ya, Lanjutkan</button>
+                `;
+                document.getElementById('msgCancel').onclick = closeMsgBox;
+                document.getElementById('msgConfirm').onclick = () => { closeMsgBox(); onConfirm(); };
+            } else {
+                btnArea.innerHTML = `<button onclick="closeMsgBox()" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-medium transition">Tutup</button>`;
+            }
+
+            box.classList.remove('hidden');
+            // Small delay for transition
+            setTimeout(() => {
+                content.classList.remove('scale-95', 'opacity-0');
+                content.classList.add('scale-100', 'opacity-100');
+            }, 10);
+        }
+
+        function closeMsgBox() {
+            const content = document.getElementById('msgBoxContent');
+            content.classList.remove('scale-100', 'opacity-100');
+            content.classList.add('scale-95', 'opacity-0');
+            setTimeout(() => {
+                document.getElementById('msgBox').classList.add('hidden');
+            }, 200);
+        }
+
+        // Add tailwind fade-in animation
+        tailwind.config = {
+            theme: {
+                extend: {
+                    animation: {
+                        'fade-in': 'fadeIn 0.3s ease-out',
+                    },
+                    keyframes: {
+                        fadeIn: { '0%': { opacity: '0' }, '100%': { opacity: '1' } }
+                    }
+                }
+            }
+        }
+    </script>
+
+    <script>
+        function switchLoginTab(type) {
+            const tStud = document.getElementById('tabStudent');
+            const tAdmin = document.getElementById('tabAdmin');
+            const fStud = document.getElementById('studentLoginForm');
+            const fAdmin = document.getElementById('adminLoginForm');
+
+            if(type === 'student') {
+                tStud.className = "flex-1 py-3 font-semibold text-green-700 border-b-2 border-green-600 bg-green-50 transition";
+                tAdmin.className = "flex-1 py-3 font-semibold text-gray-500 border-b-2 border-transparent hover:bg-gray-50 transition";
+                fStud.classList.remove('hidden');
+                fAdmin.classList.add('hidden');
+            } else {
+                tAdmin.className = "flex-1 py-3 font-semibold text-gray-800 border-b-2 border-gray-800 bg-gray-50 transition";
+                tStud.className = "flex-1 py-3 font-semibold text-gray-500 border-b-2 border-transparent hover:bg-green-50 transition";
+                fAdmin.classList.remove('hidden');
+                fStud.classList.add('hidden');
+            }
+        }
+
+        async function loadAppData() {
+            state.settings = await window.api.getSettings();
+            state.questions = await window.api.getQuestions();
+            
+            // Apply logo
+            if(state.settings.logo) {
+                document.getElementById('headerLogo').src = state.settings.logo;
+            }
+        }
+
+        async function handleLogin(e, type) {
+            e.preventDefault();
+            await loadAppData(); // Ensure latest data
+
+            if (type === 'admin') {
+                const u = document.getElementById('adminUser').value;
+                const p = document.getElementById('adminPass').value;
+                
+                if (u === state.settings.adminUsername && p === state.settings.adminPassword) {
+                    enterAdminMode();
+                } else {
+                    showMessage('Gagal', 'Username atau Password admin salah.', 'error');
+                }
+            } else if (type === 'student') {
+                const name = document.getElementById('studName').value.trim();
+                const presensi = document.getElementById('studPresensi').value.trim();
+                
+                if(!name || !presensi) return showMessage('Info', 'Mohon lengkapi data', 'warning');
+
+                const attempts = await window.api.getStudentAttempts(name, presensi);
+                if (attempts >= 3) {
+                    showMessage('Batas Maksimal', `Siswa atas nama <b>${name}</b> telah mencapai batas maksimal pengerjaan (3 kali).`, 'warning');
+                    return;
+                }
+
+                showMessage('Konfirmasi', `Mulai ujian atas nama <b>${name}</b>?<br>Waktu: ${state.settings.duration} Menit.`, 'info', async () => {
+                    await window.api.recordAttempt(name, presensi);
+                    startExamMode(name, presensi, 'real');
+                });
+            }
+        }
+
+        function logout() {
+            // Stop timer if running
+            if(state.exam.timerInterval) clearInterval(state.exam.timerInterval);
+            
+            document.getElementById('loginView').classList.remove('hidden');
+            document.getElementById('adminView').classList.add('hidden');
+            document.getElementById('examView').classList.add('hidden');
+            document.getElementById('resultView').classList.add('hidden');
+            document.getElementById('userInfo').classList.add('hidden');
+            
+            // Reset forms
+            document.getElementById('studentLoginForm').reset();
+            document.getElementById('adminLoginForm').reset();
+            
+            state.role = null;
+            state.user = null;
+        }
+
+        function enterAdminMode() {
+            state.role = 'admin';
+            document.getElementById('loginView').classList.add('hidden');
+            document.getElementById('adminView').classList.remove('hidden');
+            document.getElementById('userInfo').classList.remove('hidden');
+            document.getElementById('userNameDisplay').innerHTML = '<i class="fas fa-shield-alt mr-1"></i> Admin';
+            
+            // Init admin forms
+            document.getElementById('setKkm').value = state.settings.kkm || 76;
+            document.getElementById('setDuration').value = state.settings.duration || 90;
+            document.getElementById('setLogo').value = state.settings.logo || '';
+            document.getElementById('setAdminUser').value = state.settings.adminUsername;
+            
+            showAdminPanel('hasil');
+        }
+
+        function showAdminPanel(panelId) {
+            // Update tabs
+            document.querySelectorAll('.admin-nav-btn').forEach(btn => {
+                if(btn.dataset.target === panelId) {
+                    btn.classList.add('bg-green-50', 'text-green-700');
+                    btn.classList.remove('text-gray-600', 'hover:bg-gray-50');
+                } else {
+                    btn.classList.remove('bg-green-50', 'text-green-700');
+                    btn.classList.add('text-gray-600', 'hover:bg-gray-50');
+                }
+            });
+
+            // Update panels
+            document.querySelectorAll('.admin-panel').forEach(p => p.classList.add('hidden'));
+            document.getElementById('panel-' + panelId).classList.remove('hidden');
+
+            if(panelId === 'hasil') loadResultsTable();
+            if(panelId === 'soal') renderAdminQuestions();
+        }
+
+        async function saveAdminSettings() {
+            const kkm = parseInt(document.getElementById('setKkm').value);
+            const duration = parseInt(document.getElementById('setDuration').value);
+            const logo = document.getElementById('setLogo').value;
+            const newU = document.getElementById('setAdminUser').value;
+            const newP = document.getElementById('setAdminPass').value;
+
+            const updates = { kkm, duration, logo, adminUsername: newU };
+            if(newP.trim() !== '') updates.adminPassword = newP;
+
+            await window.api.saveSettings(updates);
+            state.settings = {...state.settings, ...updates};
+            
+            if(logo) document.getElementById('headerLogo').src = logo;
+            
+            showMessage('Berhasil', 'Pengaturan berhasil disimpan.', 'success');
+            document.getElementById('setAdminPass').value = ''; // clear pass field
+        }
+
+        async function loadResultsTable() {
+            const results = await window.api.getResults();
+            const tbody = document.getElementById('resultsTableBody');
+            tbody.innerHTML = '';
+            
+            // Sort by latest date descending
+            results.sort((a,b) => new Date(b.date) - new Date(a.date));
+
+            let count = 1;
+            results.forEach(r => {
+                const tr = document.createElement('tr');
+                tr.className = "hover:bg-gray-50 transition";
+                const isLulus = r.score >= (state.settings.kkm || 76);
+                const badgeClass = isLulus ? 'bg-green-100 text-green-800 border-green-200' : 'bg-red-100 text-red-800 border-red-200';
+                const badgeText = isLulus ? 'TUNTAS' : 'BELUM TUNTAS';
+                const typeBadge = r.type === 'tryout' ? '<span class="ml-2 text-[10px] bg-yellow-100 text-yellow-800 px-1 py-0.5 rounded border border-yellow-200">Ujicoba</span>' : '';
+                
+                const d = new Date(r.date);
+                const dateStr = `${d.getDate()}/${d.getMonth()+1}/${d.getFullYear()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
+
+                tr.innerHTML = `
+                    <td class="px-6 py-4 border-b border-gray-100 text-gray-500">${count++}</td>
+                    <td class="px-6 py-4 border-b border-gray-100 font-medium text-gray-800">${r.username} ${typeBadge}</td>
+                    <td class="px-6 py-4 border-b border-gray-100 text-gray-600">XII</td>
+                    <td class="px-6 py-4 border-b border-gray-100 text-center font-mono text-gray-600">${r.presensi}</td>
+                    <td class="px-6 py-4 border-b border-gray-100 text-center font-bold ${isLulus?'text-green-600':'text-red-600'}">${r.score.toFixed(1)}</td>
+                    <td class="px-6 py-4 border-b border-gray-100"><span class="px-2.5 py-1 rounded-full text-xs font-semibold border ${badgeClass}">${badgeText}</span></td>
+                    <td class="px-6 py-4 border-b border-gray-100 text-gray-500 text-sm">${dateStr}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            if(results.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="7" class="px-6 py-8 text-center text-gray-400">Belum ada data hasil ujian.</td></tr>`;
+            }
+        }
+
+        function downloadCSV() {
+            const table = document.querySelector('table');
+            let csv = [];
+            // Header
+            let row = [];
+            table.querySelectorAll('th').forEach(th => row.push(`"${th.innerText}"`));
+            csv.push(row.join(','));
+            
+            // Rows
+            table.querySelectorAll('tbody tr').forEach(tr => {
+                let row = [];
+                tr.querySelectorAll('td').forEach(td => row.push(`"${td.innerText.replace(/"/g, '""')}"`));
+                csv.push(row.join(','));
+            });
+            
+            if(csv.length <= 1) return showMessage('Info', 'Tidak ada data untuk didownload', 'info');
+
+            let csvContent = "data:text/csv;charset=utf-8," + csv.join("\n");
+            let encodedUri = encodeURI(csvContent);
+            let link = document.createElement("a");
+            link.setAttribute("href", encodedUri);
+            link.setAttribute("download", "hasil_pts_qurdis_XII.csv");
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        async function tryOutMode() {
+            showMessage('Uji Coba', 'Mulai simulasi sebagai siswa? Nilai tidak akan mempengaruhi database utama siswa.', 'info', async () => {
+                await loadAppData();
+                startExamMode('Admin (Uji Coba)', '99', 'tryout');
+            });
+        }
+    </script>
+
+    <script>
+        function renderAdminQuestions() {
+            const list = document.getElementById('questionsList');
+            list.innerHTML = '';
+            
+            let counts = { pg:0, pgk:0, jodoh:0 };
+
+            // Sort by type then ID loosely
+            let sortedQ = [...state.questions].sort((a,b) => {
+                if(a.type !== b.type) return a.type.localeCompare(b.type);
+                return a.id.localeCompare(b.id);
+            });
+
+            sortedQ.forEach((q, idx) => {
+                counts[q.type]++;
+                const card = document.createElement('div');
+                card.className = "bg-white p-4 rounded-lg border shadow-sm hover:shadow transition flex gap-4 items-start";
+                
+                let typeBadge = '';
+                if(q.type === 'pg') typeBadge = '<span class="bg-blue-100 text-blue-800 px-2 py-1 rounded text-xs font-bold border border-blue-200">Pilihan Ganda</span>';
+                if(q.type === 'pgk') typeBadge = '<span class="bg-purple-100 text-purple-800 px-2 py-1 rounded text-xs font-bold border border-purple-200">PG Kompleks</span>';
+                if(q.type === 'jodoh') typeBadge = '<span class="bg-orange-100 text-orange-800 px-2 py-1 rounded text-xs font-bold border border-orange-200">Menjodohkan</span>';
+
+                let answerPreview = '';
+                if(q.type === 'pg') answerPreview = `<p class="text-xs text-gray-500 mt-2">Kunci: <span class="font-bold text-green-600">${q.answer}</span></p>`;
+                if(q.type === 'pgk') answerPreview = `<p class="text-xs text-gray-500 mt-2">Kunci: <span class="font-bold text-green-600">${q.answer.map(i => q.options[i]).join('; ')}</span></p>`;
+                
+                card.innerHTML = `
+                    <div class="flex-1 min-w-0">
+                        <div class="flex items-center gap-2 mb-1">
+                            <span class="text-gray-400 font-mono text-xs">#${q.id}</span>
+                            ${typeBadge}
+                        </div>
+                        <p class="text-gray-800 text-sm font-medium truncate">${q.text}</p>
+                        ${answerPreview}
+                    </div>
+                    <div class="flex flex-col gap-2 shrink-0">
+                        <button onclick="editQuestion('${q.id}')" class="text-blue-600 hover:bg-blue-50 p-2 rounded transition" title="Edit"><i class="fas fa-edit"></i></button>
+                        <button onclick="deleteQuestion('${q.id}')" class="text-red-500 hover:bg-red-50 p-2 rounded transition" title="Hapus"><i class="fas fa-trash"></i></button>
+                    </div>
+                `;
+                list.appendChild(card);
+            });
+
+            document.getElementById('totalSoalCount').innerText = sortedQ.length;
+        }
+
+        function openQuestionModal(qId = null) {
+            const modal = document.getElementById('qModal');
+            const type = qId ? null : document.getElementById('newQuestionType').value;
+            
+            // Reset fields
+            document.getElementById('editQId').value = '';
+            document.getElementById('editQText').value = '';
+            const optArea = document.getElementById('editOptionsArea');
+            optArea.innerHTML = '';
+
+            let q = null;
+            if (qId) {
+                q = state.questions.find(x => x.id === qId);
+                document.getElementById('qModalTitle').innerText = 'Edit Soal';
+                document.getElementById('editQId').value = q.id;
+                document.getElementById('editQType').value = q.type;
+                document.getElementById('editQText').value = q.text;
+                buildOptionsEditor(q.type, q);
+            } else {
+                document.getElementById('qModalTitle').innerText = 'Tambah Soal Baru';
+                document.getElementById('editQId').value = 'q_' + Date.now();
+                document.getElementById('editQType').value = type;
+                buildOptionsEditor(type, null);
+            }
+
+            modal.classList.remove('hidden');
+        }
+
+        function buildOptionsEditor(type, qData) {
+            const area = document.getElementById('editOptionsArea');
+            let html = '';
+
+            if (type === 'pg') {
+                const labels = ['A', 'B', 'C', 'D', 'E'];
+                html += `<h4 class="font-semibold text-sm mb-3">Pilihan Jawaban</h4><div class="space-y-2">`;
+                for(let i=0; i<5; i++) {
+                    const val = qData && qData.options ? (qData.options[i]||'') : '';
+                    const isChecked = qData && qData.answer === labels[i] ? 'checked' : (i===0?'checked':'');
+                    html += `
+                        <div class="flex items-center gap-3 bg-white p-2 border rounded">
+                            <input type="radio" name="pgAnswer" value="${labels[i]}" ${isChecked} class="w-4 h-4 text-green-600 focus:ring-green-500">
+                            <span class="font-bold w-6 text-center">${labels[i]}.</span>
+                            <input type="text" id="pgOpt_${i}" value="${val.replace(/"/g, '&quot;')}" class="flex-1 border-b border-gray-300 focus:border-green-500 outline-none px-2 py-1 text-sm" placeholder="Opsi ${labels[i]}">
+                        </div>`;
+                }
+                html += `</div>`;
+            } 
+            else if (type === 'pgk') {
+                html += `<h4 class="font-semibold text-sm mb-1">Pernyataan & Kunci</h4>
+                         <p class="text-xs text-gray-500 mb-3">Centang pernyataan yang dianggap BENAR sebagai kunci.</p>
+                         <div class="space-y-2" id="pgkContainer">`;
+                const opts = qData && qData.options ? qData.options : ['', '', '', ''];
+                const ans = qData && qData.answer ? qData.answer : [];
+                
+                opts.forEach((opt, i) => {
+                    const isChecked = ans.includes(i) ? 'checked' : '';
+                    html += `
+                        <div class="flex items-start gap-3 bg-white p-2 border rounded pgk-row">
+                            <input type="checkbox" value="${i}" ${isChecked} class="mt-1.5 w-4 h-4 text-purple-600 focus:ring-purple-500 pgk-cb">
+                            <textarea class="flex-1 border border-gray-200 rounded p-1 text-sm focus:border-purple-500 outline-none pgk-val" rows="2" placeholder="Pernyataan...">${opt}</textarea>
+                            <button type="button" onclick="this.parentElement.remove()" class="text-red-400 hover:text-red-600"><i class="fas fa-times"></i></button>
+                        </div>`;
+                });
+                html += `</div>
+                         <button type="button" onclick="addPgkRow()" class="mt-3 text-xs bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded">+ Tambah Pernyataan</button>`;
+            }
+            else if (type === 'jodoh') {
+                html += `<h4 class="font-semibold text-sm mb-1">Pasangan Menjodohkan</h4>
+                         <p class="text-xs text-gray-500 mb-3">Masukkan pasangan yang benar. Sistem akan mengacak saat ujian.</p>
+                         <div class="space-y-2" id="jodohContainer">`;
+                const pairs = qData && qData.pairs ? qData.pairs : [{left:'', right:''}, {left:'', right:''}];
+                
+                pairs.forEach((p, i) => {
+                    html += `
+                        <div class="flex items-center gap-2 bg-white p-2 border rounded jodoh-row">
+                            <input type="text" class="flex-1 border-b text-sm p-1 outline-none focus:border-orange-500 jodoh-l" placeholder="Bagian Kiri (Misal: QS. Al-Baqarah 155)" value="${p.left.replace(/"/g, '&quot;')}">
+                            <i class="fas fa-arrows-alt-h text-gray-400 text-xs"></i>
+                            <input type="text" class="flex-1 border-b text-sm p-1 outline-none focus:border-orange-500 jodoh-r" placeholder="Bagian Kanan (Pasangan Benar)" value="${p.right.replace(/"/g, '&quot;')}">
+                            <button type="button" onclick="this.parentElement.remove()" class="text-red-400 hover:text-red-600 ml-1"><i class="fas fa-times"></i></button>
+                        </div>`;
+                });
+                html += `</div>
+                         <button type="button" onclick="addJodohRow()" class="mt-3 text-xs bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded">+ Tambah Pasangan</button>`;
+            }
+
+            area.innerHTML = html;
+        }
+
+        // Global functions for inline DOM event handlers in editor
+        window.addPgkRow = () => {
+            const c = document.getElementById('pgkContainer');
+            const i = c.querySelectorAll('.pgk-row').length;
+            const div = document.createElement('div');
+            div.className = "flex items-start gap-3 bg-white p-2 border rounded pgk-row";
+            div.innerHTML = `
+                <input type="checkbox" value="${i}" class="mt-1.5 w-4 h-4 text-purple-600 focus:ring-purple-500 pgk-cb">
+                <textarea class="flex-1 border border-gray-200 rounded p-1 text-sm focus:border-purple-500 outline-none pgk-val" rows="2" placeholder="Pernyataan..."></textarea>
+                <button type="button" onclick="this.parentElement.remove()" class="text-red-400 hover:text-red-600"><i class="fas fa-times"></i></button>
+            `;
+            c.appendChild(div);
+        }
+        window.addJodohRow = () => {
+             const c = document.getElementById('jodohContainer');
+             const div = document.createElement('div');
+             div.className = "flex items-center gap-2 bg-white p-2 border rounded jodoh-row";
+             div.innerHTML = `
+                <input type="text" class="flex-1 border-b text-sm p-1 outline-none focus:border-orange-500 jodoh-l" placeholder="Bagian Kiri">
+                <i class="fas fa-arrows-alt-h text-gray-400 text-xs"></i>
+                <input type="text" class="flex-1 border-b text-sm p-1 outline-none focus:border-orange-500 jodoh-r" placeholder="Bagian Kanan">
+                <button type="button" onclick="this.parentElement.remove()" class="text-red-400 hover:text-red-600 ml-1"><i class="fas fa-times"></i></button>
+             `;
+             c.appendChild(div);
+        }
+
+        function closeQuestionModal() {
+            document.getElementById('qModal').classList.add('hidden');
+        }
+
+        async function saveEditedQuestion() {
+            const id = document.getElementById('editQId').value;
+            const type = document.getElementById('editQType').value;
+            const text = document.getElementById('editQText').value.trim();
+            
+            if(!text) return showMessage('Peringatan', 'Teks soal tidak boleh kosong', 'warning');
+
+            let newQ = { id, type, text };
+
+            if(type === 'pg') {
+                let opts = [];
+                for(let i=0; i<5; i++) opts.push(document.getElementById(`pgOpt_${i}`).value.trim());
+                newQ.options = opts;
+                newQ.answer = document.querySelector('input[name="pgAnswer"]:checked').value;
+            } 
+            else if(type === 'pgk') {
+                let opts = [];
+                let ans = [];
+                const rows = document.querySelectorAll('.pgk-row');
+                rows.forEach((r, i) => {
+                    opts.push(r.querySelector('.pgk-val').value.trim());
+                    // Re-index checkboxes based on current visual order
+                    if(r.querySelector('.pgk-cb').checked) ans.push(i);
+                });
+                if(ans.length === 0) return showMessage('Peringatan', 'Minimal pilih 1 jawaban benar untuk PG Kompleks', 'warning');
+                newQ.options = opts;
+                newQ.answer = ans;
+            }
+            else if(type === 'jodoh') {
+                let pairs = [];
+                document.querySelectorAll('.jodoh-row').forEach(r => {
+                    const l = r.querySelector('.jodoh-l').value.trim();
+                    const rt = r.querySelector('.jodoh-r').value.trim();
+                    if(l && rt) pairs.push({left: l, right: rt});
+                });
+                if(pairs.length < 2) return showMessage('Peringatan', 'Minimal 2 pasangan untuk menjodohkan', 'warning');
+                newQ.pairs = pairs;
+            }
+
+            await window.api.saveQuestion(newQ);
+            
+            // update local state
+            const idx = state.questions.findIndex(x => x.id === id);
+            if(idx >= 0) state.questions[idx] = newQ;
+            else state.questions.push(newQ);
+
+            closeQuestionModal();
+            renderAdminQuestions();
+        }
+
+        function editQuestion(id) {
+            openQuestionModal(id);
+        }
+
+        function deleteQuestion(id) {
+            showMessage('Hapus Soal', 'Yakin ingin menghapus soal ini secara permanen?', 'warning', async () => {
+                await window.api.deleteQuestionFromDB(id);
+                state.questions = state.questions.filter(x => x.id !== id);
+                renderAdminQuestions();
+            });
+        }
+    </script>
+
+    <script>
+        // Fisher-Yates shuffle
+        function shuffleArray(array) {
+            let curId = array.length;
+            while (0 !== curId) {
+                let randId = Math.floor(Math.random() * curId);
+                curId -= 1;
+                let tmp = array[curId];
+                array[curId] = array[randId];
+                array[randId] = tmp;
+            }
+            return array;
+        }
+
+        function startExamMode(name, presensi, modeType) {
+            state.role = modeType;
+            state.user = { name, presensi };
+            
+            // Hide everything, show exam view
+            document.getElementById('loginView').classList.add('hidden');
+            document.getElementById('adminView').classList.add('hidden');
+            document.getElementById('examView').classList.remove('hidden');
+            document.getElementById('userInfo').classList.remove('hidden');
+            document.getElementById('userNameDisplay').innerHTML = `<i class="fas fa-user mr-1"></i> ${name}`;
+            document.getElementById('examStudentName').innerText = `${name} | Kelas XII | No: ${presensi}`;
+
+            // Prepare Exam State
+            state.exam.active = true;
+            state.exam.answers = {};
+            state.exam.currentIndex = 0;
+            
+            // Build question set exactly 40 (15 PG, 15 PGK, 10 Jodoh) based on available data
+            let pg = shuffleArray(state.questions.filter(q => q.type === 'pg')).slice(0, 15);
+            let pgk = shuffleArray(state.questions.filter(q => q.type === 'pgk')).slice(0, 15);
+            let jodoh = shuffleArray(state.questions.filter(q => q.type === 'jodoh')).slice(0, 10);
+            
+            state.exam.questions = [...pg, ...pgk, ...jodoh];
+            
+            // Initialize answers structure
+            state.exam.questions.forEach((q, i) => {
+                // Attach a display index 1-40
+                q.displayIndex = i + 1;
+                
+                if (q.type === 'pg') state.exam.answers[q.id] = null;
+                if (q.type === 'pgk') state.exam.answers[q.id] = []; // array of selected indices
+                if (q.type === 'jodoh') {
+                    // pre-shuffle the right sides for the UI
+                    let rights = shuffleArray(q.pairs.map(p => p.right));
+                    q.shuffledRights = rights;
+                    // answer will map left side string to right side string
+                    state.exam.answers[q.id] = {}; 
+                }
+            });
+
+            buildExamNavigator();
+            renderActiveQuestion();
+            startTimer();
+        }
+
+        function startTimer() {
+            let durationMin = state.settings.duration || 90;
+            state.exam.timeLeft = durationMin * 60;
+            
+            const display = document.getElementById('timerDisplay');
+            
+            if(state.exam.timerInterval) clearInterval(state.exam.timerInterval);
+            
+            state.exam.timerInterval = setInterval(() => {
+                if(state.exam.timeLeft <= 0) {
+                    clearInterval(state.exam.timerInterval);
+                    forceSubmitExam();
+                    return;
+                }
+                
+                state.exam.timeLeft--;
+                let m = Math.floor(state.exam.timeLeft / 60);
+                let s = state.exam.timeLeft % 60;
+                display.innerText = `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+                
+                if(state.exam.timeLeft < 300) { // last 5 mins
+                    display.parentElement.classList.remove('bg-gray-700', 'text-red-400');
+                    display.parentElement.classList.add('bg-red-600', 'text-white', 'animate-pulse');
+                }
+            }, 1000);
+        }
+
+        function buildExamNavigator() {
+            const gridPG = document.getElementById('navGridPG');
+            const gridPGK = document.getElementById('navGridPGK');
+            const gridJodoh = document.getElementById('navGridJodoh');
+            
+            gridPG.innerHTML = ''; gridPGK.innerHTML = ''; gridJodoh.innerHTML = '';
+
+            state.exam.questions.forEach((q, i) => {
+                const btn = document.createElement('button');
+                btn.className = "nav-btn w-full aspect-square flex items-center justify-center text-xs font-bold rounded-sm border bg-white border-gray-400 text-gray-700 transition hover:bg-gray-100";
+                btn.innerText = q.displayIndex;
+                btn.id = 'navBtn_' + i;
+                btn.onclick = () => jumpToQuestion(i);
+                
+                if(q.type === 'pg') gridPG.appendChild(btn);
+                if(q.type === 'pgk') gridPGK.appendChild(btn);
+                if(q.type === 'jodoh') gridJodoh.appendChild(btn);
+            });
+            updateNavigatorUI();
+        }
+
+        function updateNavigatorUI() {
+            if(!state.exam.active) return;
+            state.exam.questions.forEach((q, i) => {
+                const btn = document.getElementById('navBtn_' + i);
+                if(!btn) return;
+                
+                let isAnswered = false;
+                const ans = state.exam.answers[q.id];
+                if(q.type === 'pg') isAnswered = ans !== null;
+                if(q.type === 'pgk') isAnswered = ans && ans.length > 0;
+                if(q.type === 'jodoh') isAnswered = ans && Object.keys(ans).length === q.pairs.length;
+
+                // Reset classes
+                btn.className = "nav-btn w-full aspect-square flex items-center justify-center text-xs font-bold rounded-sm border transition ";
+                
+                if(i === state.exam.currentIndex) {
+                    btn.className += " ring-2 ring-blue-500 ring-offset-1 "; // Active state
+                }
+
+                if(isAnswered) {
+                    btn.className += " bg-green-500 text-white border-green-600";
+                } else {
+                    btn.className += " bg-white border-gray-400 text-gray-700 hover:bg-gray-100";
+                }
+            });
+        }
+
+        function jumpToQuestion(index) {
+            state.exam.currentIndex = index;
+            renderActiveQuestion();
+            document.getElementById('questionArea').scrollTo(0,0);
+        }
+        function prevQuestion() {
+            if(state.exam.currentIndex > 0) jumpToQuestion(state.exam.currentIndex - 1);
+        }
+        function nextQuestion() {
+            if(state.exam.currentIndex < state.exam.questions.length - 1) jumpToQuestion(state.exam.currentIndex + 1);
+        }
+
+        function renderActiveQuestion() {
+            const area = document.getElementById('examContentArea');
+            const qIndex = state.exam.currentIndex;
+            const q = state.exam.questions[qIndex];
+            
+            document.getElementById('btnPrevQ').disabled = qIndex === 0;
+            document.getElementById('btnNextQ').disabled = qIndex === state.exam.questions.length - 1;
+
+            let badge = '';
+            if(q.type==='pg') badge = 'Pilihan Ganda';
+            if(q.type==='pgk') badge = 'Pilihan Ganda Kompleks';
+            if(q.type==='jodoh') badge = 'Menjodohkan';
+
+            let html = `
+                <div class="mb-6 border-b pb-4">
+                    <div class="flex items-center gap-3 mb-4">
+                        <div class="bg-gray-800 text-white w-10 h-10 flex items-center justify-center font-bold rounded-lg text-lg">${q.displayIndex}</div>
+                        <span class="text-xs font-bold px-2 py-1 bg-gray-200 rounded text-gray-700 uppercase tracking-wider">${badge}</span>
+                    </div>
+                    <div class="text-lg text-gray-800 leading-relaxed font-medium" style="white-space: pre-wrap;">${q.text}</div>
+                </div>
+                <div class="space-y-3" id="answerArea_${q.id}">
+            `;
+
+            // Render Options based on type
+            if(q.type === 'pg') {
+                const labels = ['A', 'B', 'C', 'D', 'E'];
+                const currAns = state.exam.answers[q.id];
+                q.options.forEach((opt, i) => {
+                    const isSel = currAns === labels[i];
+                    html += `
+                        <label class="flex items-start gap-4 p-4 border rounded-xl cursor-pointer transition ${isSel ? 'bg-blue-50 border-blue-400 ring-1 ring-blue-400' : 'bg-white hover:bg-gray-50'}">
+                            <input type="radio" name="pg_${q.id}" value="${labels[i]}" class="mt-1 w-5 h-5 text-blue-600 focus:ring-blue-500" ${isSel ? 'checked' : ''} onchange="saveAnswerPG('${q.id}', '${labels[i]}')">
+                            <div class="flex-1">
+                                <span class="font-bold mr-2 text-gray-700">${labels[i]}.</span>
+                                <span class="text-gray-700">${opt}</span>
+                            </div>
+                        </label>
+                    `;
+                });
+            } 
+            else if(q.type === 'pgk') {
+                const currAns = state.exam.answers[q.id] || [];
+                html += `<p class="text-sm text-purple-700 bg-purple-50 p-2 rounded mb-4 font-medium"><i class="fas fa-info-circle"></i> Pilih lebih dari satu jawaban yang benar.</p>`;
+                q.options.forEach((opt, i) => {
+                    const isSel = currAns.includes(i);
+                    html += `
+                        <label class="flex items-start gap-4 p-4 border rounded-xl cursor-pointer transition ${isSel ? 'bg-purple-50 border-purple-400 ring-1 ring-purple-400' : 'bg-white hover:bg-gray-50'}">
+                            <input type="checkbox" value="${i}" class="mt-1 w-5 h-5 text-purple-600 focus:ring-purple-500 rounded" ${isSel ? 'checked' : ''} onchange="saveAnswerPGK('${q.id}', ${i}, this.checked)">
+                            <div class="flex-1 text-gray-700">${opt}</div>
+                        </label>
+                    `;
+                });
+            }
+            else if(q.type === 'jodoh') {
+                html += `<p class="text-sm text-orange-700 bg-orange-50 p-2 rounded mb-4 font-medium"><i class="fas fa-info-circle"></i> Geser/tarik pilihan di sebelah kanan untuk mencocokkan dengan bagian kiri.</p>`;
+                
+                // Clear old sortables
+                state.sortables.forEach(s => s.destroy());
+                state.sortables = [];
+
+                html += `<div class="flex flex-col md:flex-row gap-4">
+                            <div class="flex-1 space-y-2">
+                                <h4 class="font-bold text-center text-sm mb-3 text-gray-500 uppercase tracking-wider">Bagian (Pertanyaan)</h4>`;
+                
+                q.pairs.forEach((p, i) => {
+                    html += `<div class="p-3 bg-gray-100 border border-gray-300 rounded shadow-sm text-sm min-h-[60px] flex items-center h-full">${p.left}</div>`;
+                });
+                
+                html += `   </div>
+                            <div class="flex flex-col justify-center items-center gap-2 py-4">`;
+                for(let i=0; i<q.pairs.length; i++) html += `<i class="fas fa-arrow-right text-gray-300 hidden md:block mt-8"></i>`;
+                html += `   </div>
+                            <div class="flex-1 space-y-2">
+                                <h4 class="font-bold text-center text-sm mb-3 text-gray-500 uppercase tracking-wider">Pasangan (Jawaban)</h4>
+                                <div id="jodohListRight_${q.id}" class="space-y-2 min-h-[200px]">`;
+                
+                // Generate current right side order based on saved answers or shuffled initial
+                let rightItems = [];
+                const savedAns = state.exam.answers[q.id];
+                if(savedAns && Object.keys(savedAns).length > 0) {
+                     // Reconstruct based on saved map
+                     q.pairs.forEach(p => {
+                         if(savedAns[p.left]) rightItems.push(savedAns[p.left]);
+                     });
+                     // Add remaining unmapped
+                     q.shuffledRights.forEach(r => {
+                         if(!rightItems.includes(r)) rightItems.push(r);
+                     });
+                } else {
+                     rightItems = [...q.shuffledRights];
+                }
+
+                rightItems.forEach((r, i) => {
+                     html += `<div class="drag-item p-3 bg-white border-2 border-orange-200 hover:border-orange-400 rounded shadow-sm text-sm min-h-[60px] flex items-center gap-3 transition-colors" data-val="${r.replace(/"/g, '&quot;')}">
+                                <i class="fas fa-grip-vertical text-gray-300"></i> ${r}
+                              </div>`;
+                });
+                
+                html += `       </div>
+                            </div>
+                         </div>`;
+            }
+
+            html += `</div>`; // end space-y-3
+            area.innerHTML = html;
+            updateNavigatorUI();
+
+            // Initialize Sortable for Jodoh
+            if(q.type === 'jodoh') {
+                const el = document.getElementById(`jodohListRight_${q.id}`);
+                const sortable = Sortable.create(el, {
+                    animation: 150,
+                    handle: '.drag-item',
+                    ghostClass: 'opacity-50',
+                    onEnd: function() {
+                        saveAnswerJodoh(q.id);
+                    }
+                });
+                state.sortables.push(sortable);
+            }
+        }
+
+        // Answer Savers
+        window.saveAnswerPG = function(qId, val) {
+            state.exam.answers[qId] = val;
+            updateNavigatorUI();
+            // visual update done by browser radio state, but let's re-render active to apply styles
+            renderActiveQuestion();
+        }
+        window.saveAnswerPGK = function(qId, index, isChecked) {
+            let arr = state.exam.answers[qId] || [];
+            if(isChecked && !arr.includes(index)) arr.push(index);
+            if(!isChecked) arr = arr.filter(x => x !== index);
+            state.exam.answers[qId] = arr;
+            updateNavigatorUI();
+            renderActiveQuestion();
+        }
+        window.saveAnswerJodoh = function(qId) {
+            const q = state.exam.questions.find(x => x.id === qId);
+            const container = document.getElementById(`jodohListRight_${q.id}`);
+            if(!container) return;
+            
+            const rightElements = container.querySelectorAll('.drag-item');
+            let ansMap = {};
+            q.pairs.forEach((p, i) => {
+                if(rightElements[i]) {
+                    ansMap[p.left] = rightElements[i].dataset.val;
+                }
+            });
+            state.exam.answers[qId] = ansMap;
+            updateNavigatorUI();
+        }
+
+        function confirmSubmitExam() {
+            // Count unanswered
+            let unanswered = 0;
+            state.exam.questions.forEach(q => {
+                const ans = state.exam.answers[q.id];
+                if(q.type === 'pg' && ans === null) unanswered++;
+                if(q.type === 'pgk' && (!ans || ans.length === 0)) unanswered++;
+                if(q.type === 'jodoh' && (!ans || Object.keys(ans).length < q.pairs.length)) unanswered++; // strictly shouldn't happen with UI, but safety check
+            });
+
+            let msg = 'Apakah Anda yakin ingin menyelesaikan ujian ini?';
+            if(unanswered > 0) {
+                msg = `<span class="text-red-600 font-bold">Ada ${unanswered} soal yang belum dijawab.</span><br>` + msg;
+            }
+
+            showMessage('Konfirmasi Selesai', msg, 'warning', forceSubmitExam);
+        }
+
+        function forceSubmitExam() {
+            if(state.exam.timerInterval) clearInterval(state.exam.timerInterval);
+            state.exam.active = false;
+            
+            // Calculate Score
+            let scorePG = 0;
+            let scorePGK = 0;
+            let scoreJodoh = 0;
+
+            let correctPG = 0, correctPGK = 0, correctJodoh = 0;
+            let totalPG = 0, totalPGK = 0, totalJodoh = 0;
+
+            state.exam.questions.forEach(q => {
+                const userAns = state.exam.answers[q.id];
+                
+                if(q.type === 'pg') {
+                    totalPG++;
+                    if(userAns === q.answer) correctPG++;
+                }
+                else if(q.type === 'pgk') {
+                    totalPGK++;
+                    if(userAns && Array.isArray(userAns)) {
+                        // All chosen must be correct, and length must match
+                        const isCorrect = userAns.length === q.answer.length && userAns.every(v => q.answer.includes(parseInt(v)));
+                        if(isCorrect) correctPGK++;
+                    }
+                }
+                else if(q.type === 'jodoh') {
+                    totalJodoh++; // we count per question, not per pair for simplicity, but let's do partial scoring
+                    let pairCorrect = 0;
+                    if(userAns) {
+                         q.pairs.forEach(p => {
+                             if(userAns[p.left] === p.right) pairCorrect++;
+                         });
+                    }
+                    correctJodoh += (pairCorrect / q.pairs.length); // partial point 0 to 1
+                }
+            });
+
+            // Weighting logic (can be adjusted). Let's make total score 100.
+            // PG: 15 items * 2 = 30 max
+            // PGK: 15 items * 3 = 45 max
+            // Jodoh: 10 items * 2.5 = 25 max
+            // Total = 100
+            
+            const maxPG = 30, maxPGK = 45, maxJodoh = 25;
+            
+            let valPG = totalPG > 0 ? (correctPG / totalPG) * maxPG : 0;
+            let valPGK = totalPGK > 0 ? (correctPGK / totalPGK) * maxPGK : 0;
+            let valJodoh = totalJodoh > 0 ? (correctJodoh / totalJodoh) * maxJodoh : 0;
+
+            let finalScore = valPG + valPGK + valJodoh;
+            
+            // Save to DB
+            const resultData = {
+                username: state.user.name,
+                presensi: state.user.presensi,
+                score: finalScore,
+                date: new Date().toISOString(),
+                type: state.role, // 'real' or 'tryout'
+                details: {
+                    pg: `${correctPG}/${totalPG}`,
+                    pgk: `${correctPGK}/${totalPGK}`,
+                    jodoh: `${Math.round(correctJodoh)}/${totalJodoh}`
+                }
+            };
+            
+            if(state.role === 'real') {
+                window.api.saveResult(resultData);
+            }
+
+            showResultScreen(resultData);
+        }
+
+        function showResultScreen(res) {
+            document.getElementById('examView').classList.add('hidden');
+            document.getElementById('resultView').classList.remove('hidden');
+            
+            const scoreEl = document.getElementById('finalScoreDisplay');
+            scoreEl.innerText = res.score.toFixed(1);
+            
+            const kkm = state.settings.kkm || 76;
+            const kkmEl = document.getElementById('kkmStatus');
+            if(res.score >= kkm) {
+                kkmEl.className = "mb-8 p-3 rounded-lg font-semibold text-lg bg-green-100 text-green-800 border border-green-200";
+                kkmEl.innerHTML = `<i class="fas fa-check-circle mr-2"></i> Selamat, Anda TUNTAS KKM (${kkm})`;
+                scoreEl.className = "text-6xl font-black text-green-600";
+            } else {
+                kkmEl.className = "mb-8 p-3 rounded-lg font-semibold text-lg bg-red-100 text-red-800 border border-red-200";
+                kkmEl.innerHTML = `<i class="fas fa-times-circle mr-2"></i> Mohon maaf, Anda BELUM TUNTAS KKM (${kkm})`;
+                scoreEl.className = "text-6xl font-black text-red-600";
+            }
+
+            document.getElementById('resName').innerText = res.username;
+            document.getElementById('resPresensi').innerText = res.presensi;
+            document.getElementById('resPG').innerText = res.details.pg;
+            document.getElementById('resPGK').innerText = res.details.pgk;
+            document.getElementById('resJodoh').innerText = res.details.jodoh;
+            
+            // Store globally for download button
+            window._currentResultForDownload = res;
+        }
+
+        function downloadStudentResult() {
+             const res = window._currentResultForDownload;
+             if(!res) return;
+             
+             const kkm = state.settings.kkm || 76;
+             const status = res.score >= kkm ? 'LULUS (TUNTAS)' : 'BELUM LULUS';
+             
+             let text = `BUKTI HASIL PTS AL-QUR'AN HADIS XII\n`;
+             text += `=====================================\n`;
+             text += `Nama Siswa    : ${res.username}\n`;
+             text += `No. Presensi  : ${res.presensi}\n`;
+             text += `Kelas         : XII\n`;
+             text += `Waktu Selesai : ${new Date(res.date).toLocaleString()}\n`;
+             text += `-------------------------------------\n`;
+             text += `NILAI AKHIR   : ${res.score.toFixed(1)}\n`;
+             text += `STATUS KKM    : ${status} (KKM: ${kkm})\n`;
+             text += `-------------------------------------\n`;
+             text += `Rincian Benar:\n`;
+             text += `- Pilihan Ganda          : ${res.details.pg}\n`;
+             text += `- Pilihan Ganda Kompleks : ${res.details.pgk}\n`;
+             text += `- Menjodohkan            : ${res.details.jodoh}\n`;
+             text += `=====================================\n`;
+             text += `Disusun oleh: Damat, S.Ag., S.Pd.\n`;
+             text += `MA. Mu'allimin NU Kota Malang\n`;
+
+             let blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+             let link = document.createElement("a");
+             link.href = URL.createObjectURL(blob);
+             link.download = `Hasil_PTS_${res.username.replace(/\s+/g,'_')}.txt`;
+             document.body.appendChild(link);
+             link.click();
+             document.body.removeChild(link);
+        }
+    </script>
+</body>
+</html>
